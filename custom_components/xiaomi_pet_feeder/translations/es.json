@@ -225,6 +225,7 @@
     "auth_expired": { "message": "La sesión de Xiaomi caducó. Vuelve a iniciar sesión desde la página de la integración." },
     "update_failed": { "message": "No se pudo actualizar desde la nube de Xiaomi: {error}" },
     "device_offline": { "message": "El comedero está desconectado." },
+    "timezone_unknown": { "message": "El comedero no informó una zona horaria utilizable y Home Assistant tampoco tiene una, así que no se leyó el historial en la nube y no se modificó el programa." },
     "command_failed": { "message": "El comedero no aceptó la orden: {error}" },
     "invalid_portions": { "message": "Las porciones deben estar entre {min} y {max}." },
     "busy": { "message": "El comedero ya está dispensando." },

@@ -17,8 +17,15 @@ _RECORD_REFRESH_DELAYS = (timedelta(seconds=20), timedelta(seconds=90))
 
 
 def device_minutes(feeder: Feeder) -> int:
-    """Minutes since midnight in device time."""
-    now = device_now(feeder.records.tz_offset)
+    """Minutes since midnight in device time.
+
+    Refuses when the timezone is unknown so a schedule write cannot stamp the
+    wrong entries as already skipped.
+    """
+    status = feeder.status.data
+    if status is None or not status.timezone_resolved:
+        raise ServiceValidationError(translation_domain=DOMAIN, translation_key="timezone_unknown")
+    now = device_now(status.tz_offset)
     return now.hour * 60 + now.minute
 
 

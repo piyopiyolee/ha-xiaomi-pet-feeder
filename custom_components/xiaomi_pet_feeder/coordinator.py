@@ -29,14 +29,35 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+def home_assistant_utc_offset(hass: HomeAssistant) -> int | None:
+    """UTC offset of the configured Home Assistant timezone, in seconds.
+
+    Positive is east of UTC, the same sign as MIoT property 5.17. None means
+    Home Assistant has no usable timezone, which is not the same as UTC.
+    """
+    zone_name = hass.config.time_zone
+    if not zone_name:
+        return None
+    zone = dt_util.get_time_zone(zone_name)
+    if zone is None:
+        return None
+    offset = datetime.now(zone).utcoffset()
+    if offset is None:
+        return None
+    return int(offset.total_seconds())
+
+
 @dataclass(slots=True)
 class FeederRecords:
     """Cloud side data: what the app shows from its eco service."""
 
-    eaten_today: int
-    today: list[FeedRecord]
+    eaten_today: int | None
+    today: list[FeedRecord] | None
     new: list[FeedRecord] = field(default_factory=list)
     desiccant: Desiccant | None = None
+    intake_confirmed: bool = True
+    offsets: tuple[int, ...] = ()
+    summary_offset: int | None = None
 
 
 class FeederStatusCoordinator(DataUpdateCoordinator[FeederStatus]):
@@ -78,15 +99,20 @@ class FeederStatusCoordinator(DataUpdateCoordinator[FeederStatus]):
             ) from err
         if not status.values:
             raise UpdateFailed(translation_domain=DOMAIN, translation_key="device_offline")
+        status.tz_fallback = home_assistant_utc_offset(self.hass)
+        _LOGGER.debug(
+            "Feeder timezone source=%s offset_seconds=%s dst=%s",
+            status.timezone_source,
+            status.tz_offset if status.timezone_resolved else None,
+            status.dst,
+        )
         return status
 
     def apply(self, prop: tuple[int, int], value: Any) -> None:
         """Optimistically store a value we just wrote."""
         if self.data is None:
             return
-        values = dict(self.data.values)
-        values[prop] = value
-        self.async_set_updated_data(FeederStatus(values))
+        self.async_set_updated_data(self.data.with_value(prop, value))
 
 
 class FeederRecordsCoordinator(DataUpdateCoordinator[FeederRecords]):
@@ -140,24 +166,26 @@ class FeederRecordsCoordinator(DataUpdateCoordinator[FeederRecords]):
         self._pending.clear()
         await super().async_shutdown()
 
-    @property
-    def tz_offset(self) -> int:
-        """Device timezone offset in seconds."""
-        return self.status.data.tz_offset if self.status.data else 0
-
-    @property
-    def dst(self) -> bool:
-        """Device DST flag."""
-        return self.status.data.dst if self.status.data else False
-
     def invalidate_desiccant(self) -> None:
         """Force the desiccant to be fetched on the next refresh."""
         self._desiccant_at = None
 
     async def _async_update_data(self) -> FeederRecords:
+        status = self.status.data
+        if status is None or not status.timezone_resolved:
+            raise UpdateFailed(translation_domain=DOMAIN, translation_key="timezone_unknown")
+        event_default = status.timezone_source == "home_assistant"
+        confirmed = status.timezone_source == "device"
         try:
-            eaten = await self.api.eaten_today(self.tz_offset)
-            today = await self.api.records_today(self.tz_offset, self.dst)
+            eaten = await self.api.eaten_today(
+                status.tz_offset,
+                status.dst,
+                event_default=event_default,
+                confirmed=confirmed,
+            )
+            found = await self.api.records_today(
+                status.tz_offset, status.dst, event_default=event_default
+            )
             await self._update_desiccant()
         except XiaomiAuthError as err:
             raise ConfigEntryAuthFailed(
@@ -170,15 +198,28 @@ class FeederRecordsCoordinator(DataUpdateCoordinator[FeederRecords]):
                 translation_placeholders={"error": str(err)},
             ) from err
 
-        keys = {r.key for r in today}
-        if self._seen is None:
+        # A numeric 0 plus an empty log is verified only for a device-reported offset.
+        today = None if eaten.grams is None and not found else found
+        if today is None:
             new: list[FeedRecord] = []
-            self._seen = keys
         else:
-            new = [r for r in today if r.key not in self._seen]
-            # Keep yesterday's keys too so a late upload around midnight is not lost.
-            self._seen = (self._seen | keys) if len(self._seen) < 2000 else keys
-        return FeederRecords(eaten_today=eaten, today=today, new=new, desiccant=self._desiccant)
+            keys = {record.key for record in today}
+            if self._seen is None:
+                new = []
+                self._seen = keys
+            else:
+                new = [record for record in today if record.key not in self._seen]
+                # Keep yesterday's keys too so a late upload around midnight is not lost.
+                self._seen = (self._seen | keys) if len(self._seen) < 2000 else keys
+        return FeederRecords(
+            eaten_today=eaten.grams,
+            today=today,
+            new=new,
+            desiccant=self._desiccant,
+            intake_confirmed=eaten.confirmed,
+            offsets=eaten.offsets,
+            summary_offset=eaten.offset,
+        )
 
     async def _update_desiccant(self) -> None:
         if self._home is None:

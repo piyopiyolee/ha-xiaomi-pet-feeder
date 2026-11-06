@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 from unittest.mock import patch
 
@@ -50,13 +51,21 @@ async def test_entities_match_the_app(
     hass: HomeAssistant, entry: MockConfigEntry, cloud: FakeCloud
 ) -> None:
     """Values come from the real responses captured from a feeder."""
+    # The captured bowl row is a cloud cache. Its original updateTime is the
+    # capture day; mark that report as just now so it is still current.
+    cloud.set_prop_fields(2, 22, updateTime=int(time.time()))
     await setup(hass, entry)
 
     def state(platform: str, key: str) -> str:
         return hass.states.get(eid(hass, platform, key)).state
 
     assert state("sensor", "eaten_today") == "12"
-    assert state("sensor", "bowl_food") == "0"
+    bowl = hass.states.get(eid(hass, "sensor", "bowl_food"))
+    assert bowl.state == "0"
+    assert bowl.attributes["origin"] == "cloud_cache"
+    assert bowl.attributes["live"] is False
+    assert bowl.attributes["stale"] is False
+    assert bowl.attributes["last_reported_grams"] == 0
     assert state("sensor", "schedule_progress") == "25"
     assert state("sensor", "status") == "food_low"
     assert state("sensor", "desiccant") == "exhausted"

@@ -18,7 +18,14 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 import voluptuous as vol
 
-from .api import FeedingSchedule, ScheduleEntry, XiaomiError, device_midnight, device_now
+from .api import (
+    FeederStatus,
+    FeedingSchedule,
+    ScheduleEntry,
+    XiaomiError,
+    device_midnight,
+    device_now,
+)
 from .api.schedule import MAX_PORTIONS, MIN_PORTIONS
 from .commands import current_schedule, device_minutes, dispense, write_schedule
 from .const import (
@@ -115,6 +122,19 @@ def _schedule_response(feeder: Feeder) -> dict[str, Any]:
     }
 
 
+def _resolved_status(feeder: Feeder) -> FeederStatus:
+    """Status whose day boundary is known. Unknown is not UTC."""
+    status = feeder.status.data
+    if status is None or not status.timezone_resolved:
+        raise HomeAssistantError(translation_domain=DOMAIN, translation_key="timezone_unknown")
+    return status
+
+
+def _event_default(status: FeederStatus) -> bool:
+    """Ask the zero event partition only when 5.17 did not supply the offset."""
+    return status.timezone_source == "home_assistant"
+
+
 async def _cloud(coro: Any) -> Any:
     try:
         return await coro
@@ -190,7 +210,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_history(call: ServiceCall) -> ServiceResponse:
         feeder = _feeder(hass, call)
-        status = feeder.status.data
+        status = _resolved_status(feeder)
         end = device_now(status.tz_offset)
         start_day = end.date() - timedelta(days=call.data[ATTR_DAYS] - 1)
         records = await _cloud(
@@ -199,23 +219,42 @@ def async_setup_services(hass: HomeAssistant) -> None:
                 device_midnight(status.tz_offset, start_day),
                 device_midnight(status.tz_offset, end.date()) + 86399,
                 status.dst,
+                event_default=_event_default(status),
             )
         )
-        return {"records": [r.as_dict() for r in records]}
+        return {
+            "records": [record.as_dict() for record in records],
+            "intake_confirmed": status.timezone_source == "device" or bool(records),
+        }
 
     async def handle_hourly(call: ServiceCall) -> ServiceResponse:
         feeder = _feeder(hass, call)
-        status = feeder.status.data
+        status = _resolved_status(feeder)
         day: date = call.data.get(ATTR_DATE) or device_now(status.tz_offset).date()
-        return await _cloud(feeder.api.hourly(status.tz_offset, day))
+        return await _cloud(
+            feeder.api.hourly(
+                status.tz_offset,
+                day,
+                event_default=_event_default(status),
+                confirmed=status.timezone_source == "device",
+            )
+        )
 
     async def handle_daily(call: ServiceCall) -> ServiceResponse:
         feeder = _feeder(hass, call)
-        status = feeder.status.data
+        status = _resolved_status(feeder)
         day: date = call.data.get(ATTR_DATE) or device_now(status.tz_offset).date()
         # Same week as the app: Sunday to Saturday.
         start = day - timedelta(days=(day.weekday() + 1) % 7)
-        return await _cloud(feeder.api.daily(status.tz_offset, start, start + timedelta(days=6)))
+        return await _cloud(
+            feeder.api.daily(
+                status.tz_offset,
+                start,
+                start + timedelta(days=6),
+                event_default=_event_default(status),
+                confirmed=status.timezone_source == "device",
+            )
+        )
 
     handlers = {
         SERVICE_DISPENSE: (handle_dispense, SupportsResponse.NONE),

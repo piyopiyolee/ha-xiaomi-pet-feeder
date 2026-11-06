@@ -17,8 +17,10 @@ from homeassistant.components.sensor import (
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfMass
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .api import DesiccantState, FeederStatus, Prop
+from .api.feeder import current_bowl_grams
 from .coordinator import FeederRecords
 from .data import Feeder, XiaomiPetFeederConfigEntry
 from .entity import FeederRecordsEntity, FeederStatusEntity, device_info
@@ -142,8 +144,18 @@ class StatusSensor(FeederStatusEntity, SensorEntity):
 
     @property
     def native_value(self) -> Any:
-        """Current value."""
+        """Current value. A stale cloud bowl cache is not a measurement."""
+        if self.entity_description.key == "bowl_food":
+            return current_bowl_grams(self.coordinator.data, dt_util.utcnow())
         return self.entity_description.value_fn(self.coordinator.data)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Bowl cache is labeled as cache, including when it is too old to show."""
+        if self.entity_description.key != "bowl_food" or self.coordinator.data is None:
+            return None
+        attrs = self.coordinator.data.bowl_attributes(dt_util.utcnow())
+        return attrs or None
 
 
 class EatenTodaySensor(FeederRecordsEntity, SensorEntity):
@@ -160,9 +172,19 @@ class EatenTodaySensor(FeederRecordsEntity, SensorEntity):
         super().__init__(feeder, "eaten_today")
 
     @property
-    def native_value(self) -> int:
-        """Grams eaten since device midnight."""
+    def native_value(self) -> int | None:
+        """Grams eaten since local midnight, or None when 0 is not verified."""
         return self.coordinator.data.eaten_today
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Tell a verified total from an empty eco partition."""
+        data = self.coordinator.data
+        return {
+            "intake_confirmed": data.intake_confirmed,
+            "offsets_seconds": list(data.offsets),
+            "summary_offset_seconds": data.summary_offset,
+        }
 
 
 class FeedingLogSensor(FeederRecordsEntity, SensorEntity):
@@ -176,15 +198,19 @@ class FeedingLogSensor(FeederRecordsEntity, SensorEntity):
         super().__init__(feeder, "feeding_log")
 
     @property
-    def native_value(self) -> int:
-        """Number of meals and dispenses today."""
-        return len(self.coordinator.data.today)
+    def native_value(self) -> int | None:
+        """Number of meals and dispenses today, or None when that empty is unverified."""
+        today = self.coordinator.data.today
+        if today is None:
+            return None
+        return len(today)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Today's records, newest first, like the app."""
         data: FeederRecords = self.coordinator.data
-        return {"records": [r.as_dict() for r in reversed(data.today)]}
+        records = None if data.today is None else [item.as_dict() for item in reversed(data.today)]
+        return {"records": records, "intake_confirmed": data.intake_confirmed}
 
 
 class DesiccantSensor(FeederRecordsEntity, SensorEntity):

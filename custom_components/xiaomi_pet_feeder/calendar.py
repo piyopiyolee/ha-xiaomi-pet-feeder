@@ -45,6 +45,8 @@ class FeedingCalendar(FeederStatusEntity, CalendarEntity):
     def _planned(self, start: datetime, end: datetime) -> list[CalendarEvent]:
         """Expand the daily plan into events between start and end."""
         status = self.coordinator.data
+        if status is None or not status.timezone_resolved:
+            return []
         schedule = status.schedule
         if not schedule.auto_feed:
             return []
@@ -119,12 +121,17 @@ class FeedingCalendar(FeederStatusEntity, CalendarEntity):
         history_end = min(end_date, now)
         if history_start < history_end:
             status = self.coordinator.data
+            if status is None or not status.timezone_resolved:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN, translation_key="timezone_unknown"
+                )
             try:
                 records = await self.feeder.api.records_between(
                     status.tz_offset,
                     int(history_start.timestamp()),
                     int(history_end.timestamp()),
                     status.dst,
+                    event_default=status.timezone_source == "home_assistant",
                 )
             except XiaomiError as err:
                 raise HomeAssistantError(
