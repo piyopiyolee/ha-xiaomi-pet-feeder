@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.const import CONF_USERNAME
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import CONF_CLIENT_ID, CONF_CREDENTIALS
 from .data import XiaomiPetFeederConfigEntry
@@ -40,6 +41,12 @@ async def async_get_config_entry_diagnostics(
                     for (s, p), value in (status.values.items() if status else [])
                     if (s, p) not in ((1, 3), (1, 5))  # serial numbers
                 },
+                "timezone_source": status.timezone_source if status else None,
+                "tz_offset_seconds": (
+                    status.tz_offset if status and status.timezone_resolved else None
+                ),
+                "dst": status.dst if status else None,
+                "bowl": status.bowl_attributes(dt_util.utcnow()) if status else None,
                 "eaten_today": records.eaten_today if records else None,
                 "records_today": [r.as_dict() for r in records.today] if records else None,
                 "desiccant": repr(records.desiccant) if records else None,

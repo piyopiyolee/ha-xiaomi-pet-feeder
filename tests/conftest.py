@@ -82,9 +82,26 @@ class FakeCloud:
 
     def set_prop(self, siid: int, piid: int, value: Any) -> None:
         """Change a property value returned by prop/get."""
+        self.set_prop_fields(siid, piid, value=value)
+
+    def set_prop_fields(self, siid: int, piid: int, **fields: Any) -> None:
+        """Change fields of one property result."""
         for item in self.responses["prop_get"]["result"]:
             if item["siid"] == siid and item["piid"] == piid:
-                item["value"] = value
+                item.update(fields)
+                return
+        raise KeyError((siid, piid))
+
+    def hide_prop(self, siid: int, piid: int, code: int = -4001) -> None:
+        """Make one property a failed read with no value."""
+        for item in self.responses["prop_get"]["result"]:
+            if item["siid"] == siid and item["piid"] == piid:
+                item["code"] = code
+                item.pop("value", None)
+                item.pop("otlocalts", None)
+                item["exe_time"] = 0
+                return
+        raise KeyError((siid, piid))
 
     async def post(self, _client: Any, path: str, data: Any) -> tuple[int, Any]:
         self.calls.append((path, copy.deepcopy(data)))

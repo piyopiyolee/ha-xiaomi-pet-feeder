@@ -29,6 +29,24 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+def home_assistant_utc_offset(hass: HomeAssistant) -> int | None:
+    """UTC offset of the configured Home Assistant timezone, in seconds.
+
+    Positive is east of UTC, the same sign as MIoT property 5.17. None means
+    Home Assistant has no usable timezone, which is not the same as UTC.
+    """
+    zone_name = hass.config.time_zone
+    if not zone_name:
+        return None
+    zone = dt_util.get_time_zone(zone_name)
+    if zone is None:
+        return None
+    offset = datetime.now(zone).utcoffset()
+    if offset is None:
+        return None
+    return int(offset.total_seconds())
+
+
 @dataclass(slots=True)
 class FeederRecords:
     """Cloud side data: what the app shows from its eco service."""
@@ -78,15 +96,20 @@ class FeederStatusCoordinator(DataUpdateCoordinator[FeederStatus]):
             ) from err
         if not status.values:
             raise UpdateFailed(translation_domain=DOMAIN, translation_key="device_offline")
+        status.tz_fallback = home_assistant_utc_offset(self.hass)
+        _LOGGER.debug(
+            "Feeder timezone source=%s offset_seconds=%s dst=%s",
+            status.timezone_source,
+            status.tz_offset if status.timezone_resolved else None,
+            status.dst,
+        )
         return status
 
     def apply(self, prop: tuple[int, int], value: Any) -> None:
         """Optimistically store a value we just wrote."""
         if self.data is None:
             return
-        values = dict(self.data.values)
-        values[prop] = value
-        self.async_set_updated_data(FeederStatus(values))
+        self.async_set_updated_data(self.data.with_value(prop, value))
 
 
 class FeederRecordsCoordinator(DataUpdateCoordinator[FeederRecords]):
@@ -140,24 +163,17 @@ class FeederRecordsCoordinator(DataUpdateCoordinator[FeederRecords]):
         self._pending.clear()
         await super().async_shutdown()
 
-    @property
-    def tz_offset(self) -> int:
-        """Device timezone offset in seconds."""
-        return self.status.data.tz_offset if self.status.data else 0
-
-    @property
-    def dst(self) -> bool:
-        """Device DST flag."""
-        return self.status.data.dst if self.status.data else False
-
     def invalidate_desiccant(self) -> None:
         """Force the desiccant to be fetched on the next refresh."""
         self._desiccant_at = None
 
     async def _async_update_data(self) -> FeederRecords:
+        status = self.status.data
+        if status is None or not status.timezone_resolved:
+            raise UpdateFailed(translation_domain=DOMAIN, translation_key="timezone_unknown")
         try:
-            eaten = await self.api.eaten_today(self.tz_offset)
-            today = await self.api.records_today(self.tz_offset, self.dst)
+            eaten = await self.api.eaten_today(status.tz_offset)
+            today = await self.api.records_today(status.tz_offset, status.dst)
             await self._update_desiccant()
         except XiaomiAuthError as err:
             raise ConfigEntryAuthFailed(

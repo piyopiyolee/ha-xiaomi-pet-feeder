@@ -12,12 +12,20 @@ from enum import StrEnum
 from typing import Any
 
 from .client import XiaomiCloudClient
+from .exceptions import XiaomiApiError
 from .schedule import GRAMS_PER_PORTION, FeedingSchedule
 
 SUPPORTED_MODELS = ("xiaomi.feeder.iv2001", "xiaomi.feeder.pi2001")
 
+# Both models call the same plugin service. pi2001 has no separate eco path.
 ECO_API = "/eco/pet-feeder-new/petFeederEventApi"
 ACCESS_KEY = "IOS00026747c5acafc2"
+
+# MIoT device-timezone (iv2001 5.17) is seconds east of UTC, inclusive.
+TZ_OFFSET_MIN = -43_200
+TZ_OFFSET_MAX = 50_400
+# A stored bowl reading older than this is not the current weight.
+BOWL_CACHE_MAX_AGE = dt.timedelta(hours=6)
 
 
 class Prop:
@@ -47,6 +55,9 @@ class Prop:
     PREVENT_HEAP = (5, 14)
     SCHEDULE_PROGRESS = (5, 15)
     REFILL_TRIGGER_HOURS = (5, 16)
+    # iv2001 only. pi2001 v1 and v3 do not define 5.17 or 5.19. pi2001 2.27 is
+    # an unread event argument (uint32, empty access, local read -4001), not
+    # a substitute for 5.17, and is intentionally not polled.
     TIMEZONE = (5, 17)
     SCREEN_DISPLAY = (5, 18)
     DST = (5, 19)
@@ -188,11 +199,111 @@ class Desiccant:
     total_hours: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PropertyReading:
+    """One MIoT property result, including a failed or cached read."""
+
+    value: Any
+    code: int
+    update_time: int | None
+    exe_time: int | None
+    live: bool
+
+    @property
+    def ok(self) -> bool:
+        """True when the gateway returned a value with code 0."""
+        return self.code == 0 and self.value is not None
+
+    def is_stale(self, now: dt.datetime, max_age: dt.timedelta) -> bool:
+        """Return whether a stored reading is too old to show as current."""
+        if self.code != 0 or self.value is None:
+            return True
+        if self.live:
+            return False
+        if self.update_time is None:
+            return True
+        updated = dt.datetime.fromtimestamp(self.update_time, dt.UTC)
+        return now - updated > max_age
+
+
+def parse_device_tz_offset(value: Any) -> int | None:
+    """Return 5.17 as seconds east of UTC, or None when it is not that spec.
+
+    The published range is -43200..50400 seconds. Values outside it (for
+    example milliseconds) are rejected instead of being rescaled. Zero is a
+    real UTC offset, not a missing value. Booleans are not numbers here.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError:
+            return None
+    if isinstance(value, float):
+        if not value.is_integer():
+            return None
+        value = int(value)
+    if isinstance(value, int) and TZ_OFFSET_MIN <= value <= TZ_OFFSET_MAX:
+        return value
+    return None
+
+
+def _as_grams(value: Any) -> int | None:
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        return None
+    if isinstance(value, int | float):
+        return int(value)
+    return None
+
+
+def current_bowl_grams(status: FeederStatus, now: dt.datetime) -> int | None:
+    """Grams to show as the current bowl weight, or None when that would be stale."""
+    reading = status.readings.get(Prop.BOWL_WEIGHT)
+    if reading is None or reading.is_stale(now, BOWL_CACHE_MAX_AGE):
+        return None
+    return _as_grams(reading.value)
+
+
 @dataclass(slots=True)
 class FeederStatus:
     """Snapshot of the MIoT properties."""
 
     values: dict[tuple[int, int], Any] = field(default_factory=dict)
+    readings: dict[tuple[int, int], PropertyReading] = field(default_factory=dict)
+    tz_fallback: int | None = None
+
+    @classmethod
+    def from_cloud(cls, items: list[dict[str, Any]]) -> FeederStatus:
+        """Build a snapshot from ``/miotspec/prop/get`` results.
+
+        ``code == 0`` supplies a value. Any other code, including -4001
+        (property missing or not readable), is remembered and is not a value.
+        """
+        values: dict[tuple[int, int], Any] = {}
+        readings: dict[tuple[int, int], PropertyReading] = {}
+        for item in items:
+            try:
+                key = (int(item["siid"]), int(item["piid"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            code = _optional_int(item.get("code", 0))
+            if code is None:
+                code = -1
+            exe_time = _optional_int(item.get("exe_time"))
+            update_time = _optional_int(item.get("updateTime"))
+            live = item.get("otlocalts") is not None or (exe_time is not None and exe_time > 0)
+            present = code == 0 and "value" in item
+            readings[key] = PropertyReading(
+                value=item.get("value") if present else None,
+                code=code,
+                update_time=update_time,
+                exe_time=exe_time,
+                live=live,
+            )
+            if present:
+                values[key] = item["value"]
+        return cls(values, readings)
 
     def get(self, prop: tuple[int, int], default: Any = None) -> Any:
         """Raw property value."""
@@ -209,15 +320,80 @@ class FeederStatus:
         return FeedingSchedule.parse(self.values.get(Prop.SCHEDULE))
 
     @property
-    def tz_offset(self) -> int:
-        """Device UTC offset in seconds (falls back to UTC)."""
-        value = self.values.get(Prop.TIMEZONE)
-        return int(value) if isinstance(value, int | float) else 0
+    def device_tz_offset(self) -> int | None:
+        """5.17 in seconds, or None when the device did not report a usable one."""
+        if Prop.TIMEZONE not in self.values:
+            return None
+        return parse_device_tz_offset(self.values[Prop.TIMEZONE])
 
     @property
-    def dst(self) -> bool:
-        """Whether the device reports daylight saving time (5.19)."""
-        return bool(self.values.get(Prop.DST))
+    def timezone_source(self) -> str:
+        """``device``, ``home_assistant`` or ``unknown``."""
+        if self.device_tz_offset is not None:
+            return "device"
+        if self.tz_fallback is not None:
+            return "home_assistant"
+        return "unknown"
+
+    @property
+    def timezone_resolved(self) -> bool:
+        """False when neither the device nor Home Assistant provides an offset."""
+        return self.timezone_source != "unknown"
+
+    @property
+    def tz_offset(self) -> int:
+        """UTC offset in seconds. Explicit device 0 stays 0 and is not replaced."""
+        device = self.device_tz_offset
+        if device is not None:
+            return device
+        if self.tz_fallback is not None:
+            return self.tz_fallback
+        return 0
+
+    @property
+    def dst(self) -> bool | None:
+        """5.19 when the device reports it. None means the property is absent.
+
+        False is an explicit standard-time report (iv2001) and still selects
+        the plugin's two seasonal queries. None (pi2001) does not invent one.
+        """
+        if Prop.DST not in self.values:
+            return None
+        value = self.values[Prop.DST]
+        if isinstance(value, bool):
+            return value
+        try:
+            return bool(int(value))
+        except (TypeError, ValueError):
+            return None
+
+    def with_value(self, prop: tuple[int, int], value: Any) -> FeederStatus:
+        """Copy with one optimistic value, keeping timezone fallback and reads."""
+        values = dict(self.values)
+        values[prop] = value
+        readings = dict(self.readings)
+        readings[prop] = PropertyReading(
+            value=value, code=0, update_time=None, exe_time=1, live=True
+        )
+        return FeederStatus(values, readings, self.tz_fallback)
+
+    def bowl_attributes(self, now: dt.datetime) -> dict[str, Any]:
+        """Origin of the bowl reading. A cache is never described as live."""
+        reading = self.readings.get(Prop.BOWL_WEIGHT)
+        if reading is None:
+            return {}
+        updated = None
+        if reading.update_time is not None:
+            updated = dt.datetime.fromtimestamp(reading.update_time, dt.UTC).isoformat()
+        data: dict[str, Any] = {
+            "origin": "device" if reading.live else "cloud_cache",
+            "live": reading.live,
+            "stale": reading.is_stale(now, BOWL_CACHE_MAX_AGE),
+            "last_reported_grams": _as_grams(reading.value) if reading.ok else None,
+        }
+        if updated is not None:
+            data["updated_at"] = updated
+        return data
 
 
 def device_now(tz_offset: int) -> dt.datetime:
@@ -243,7 +419,7 @@ class FeederApi:
 
     async def status(self) -> FeederStatus:
         """Read every property the integration exposes."""
-        return FeederStatus(await self.client.get_properties(self.did, POLLED_PROPS))
+        return FeederStatus.from_cloud(await self.client.get_properties(self.did, POLLED_PROPS))
 
     async def set_property(self, prop: tuple[int, int], value: Any) -> None:
         """Write a property."""
@@ -263,33 +439,44 @@ class FeederApi:
         }
 
     async def eaten_today(self, tz_offset: int) -> int:
-        """Grams eaten since device midnight (the app's "Food eaten today")."""
+        """Grams eaten since device midnight (the app's "Food eaten today").
+
+        A numeric 0 is a real zero. A null or non-numeric result is a failure,
+        not 0 g.
+        """
+        path = f"{ECO_API}/getHasEatRecord"
         result = await self.client.request(
-            f"{ECO_API}/getHasEatRecord",
+            path,
             self._eco_base(tz_offset) | {"startTime": device_midnight(tz_offset)},
         )
-        return int(result or 0)
+        return _int_result(result, path)
 
     @staticmethod
-    def _offsets(tz_offset: int, dst: bool) -> tuple[int, int]:
-        """Offsets queried by plugin 1.1.x: the device one and the DST-shifted one.
+    def _offsets(tz_offset: int, dst: bool | None) -> tuple[int, ...]:
+        """Offsets queried for one day.
 
-        Records are stored with the offset in force when they happened, so around
-        DST changes the app asks twice and merges the answers.
+        iv2001 plugin 1.1.x asks for the reported offset and the other seasonal
+        offset (``dst`` true or false). pi2001 has no 5.19, so ``dst is None``
+        and only the resolved offset is sent.
         """
+        if dst is None:
+            return (tz_offset,)
         return tz_offset, tz_offset + (-3600 if dst else 3600)
 
-    async def records_today(self, tz_offset: int, dst: bool = False) -> list[FeedRecord]:
+    async def records_today(self, tz_offset: int, dst: bool | None = None) -> list[FeedRecord]:
         """Meals and dispenses of today, oldest first."""
         rows: list[dict[str, Any]] = []
+        path = f"{ECO_API}/getFeedRecord"
         for offset in self._offsets(tz_offset, dst):
             start = device_midnight(tz_offset)
             for _ in range(10):
-                page = await self.client.request(
-                    f"{ECO_API}/getFeedRecord",
-                    self._eco_base(offset) | {"startTime": start, "pageCount": 60},
+                page = _list_result(
+                    await self.client.request(
+                        path,
+                        self._eco_base(offset) | {"startTime": start, "pageCount": 60},
+                    ),
+                    path,
                 )
-                page = page if isinstance(page, list) else []
                 rows.extend(page)
                 if len(page) < 60:
                     break
@@ -301,20 +488,23 @@ class FeederApi:
         tz_offset: int,
         start_ts: int,
         end_ts: int,
-        dst: bool = False,
+        dst: bool | None = None,
         limit: int = 2000,
     ) -> list[FeedRecord]:
         """History between two timestamps (the cloud keeps 90 days), newest first."""
         rows: list[dict[str, Any]] = []
+        path = f"{ECO_API}/multiGetFeedRecord"
         for offset in self._offsets(tz_offset, dst):
             cursor = end_ts
             fetched = 0
             while fetched < limit:
-                page = await self.client.request(
-                    f"{ECO_API}/multiGetFeedRecord",
-                    self._eco_base(offset) | {"startTime": cursor, "pageCount": 400},
+                page = _list_result(
+                    await self.client.request(
+                        path,
+                        self._eco_base(offset) | {"startTime": cursor, "pageCount": 400},
+                    ),
+                    path,
                 )
-                page = page if isinstance(page, list) else []
                 fetched += len(page)
                 rows.extend(r for r in page if start_ts <= int(r.get("ts") or 0) <= end_ts)
                 if len(page) < 400 or int(page[-1].get("ts") or 0) < start_ts:
@@ -326,11 +516,14 @@ class FeederApi:
 
     async def hourly(self, tz_offset: int, day: dt.date) -> dict[str, Any]:
         """Hourly chart of one day: grams eaten and portions dispensed per hour."""
-        result = await self.client.request(
-            f"{ECO_API}/getHourlyRecord",
-            self._eco_base(tz_offset) | {"startTime": device_midnight(tz_offset, day)},
+        path = f"{ECO_API}/getHourlyRecord"
+        result = _object_result(
+            await self.client.request(
+                path,
+                self._eco_base(tz_offset) | {"startTime": device_midnight(tz_offset, day)},
+            ),
+            path,
         )
-        result = result or {}
         return {
             "date": day.isoformat(),
             "eaten_grams": {
@@ -346,15 +539,18 @@ class FeederApi:
 
     async def daily(self, tz_offset: int, start: dt.date, end: dt.date) -> dict[str, Any]:
         """Daily chart: grams eaten and food left in the bowl at midnight."""
-        result = await self.client.request(
-            f"{ECO_API}/getDailyRecord",
-            self._eco_base(tz_offset)
-            | {
-                "startTime": device_midnight(tz_offset, start),
-                "endTime": device_midnight(tz_offset, end) + 86399,
-            },
+        path = f"{ECO_API}/getDailyRecord"
+        result = _object_result(
+            await self.client.request(
+                path,
+                self._eco_base(tz_offset)
+                | {
+                    "startTime": device_midnight(tz_offset, start),
+                    "endTime": device_midnight(tz_offset, end) + 86399,
+                },
+            ),
+            path,
         )
-        result = result or {}
         return {
             "start": start.isoformat(),
             "end": end.isoformat(),
@@ -393,11 +589,47 @@ class FeederApi:
         return None
 
 
-def _int_or_none(value: Any) -> int | None:
+def _optional_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
     try:
         return int(value)
     except TypeError, ValueError:
         return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    return _optional_int(value)
+
+
+def _int_result(result: Any, path: str) -> int:
+    """Accept a real number, including 0. Reject null and other shapes."""
+    if isinstance(result, bool) or result is None:
+        raise XiaomiApiError(path, 0, "missing numeric result")
+    if isinstance(result, int):
+        return result
+    if isinstance(result, float) and result.is_integer():
+        return int(result)
+    if isinstance(result, str):
+        try:
+            return int(result)
+        except ValueError:
+            pass
+    raise XiaomiApiError(path, 0, "missing numeric result")
+
+
+def _list_result(result: Any, path: str) -> list[Any]:
+    """Accept a list, including an empty one. Null is not an empty history."""
+    if isinstance(result, list):
+        return result
+    raise XiaomiApiError(path, 0, "missing list result")
+
+
+def _object_result(result: Any, path: str) -> dict[str, Any]:
+    """Accept an object, including an empty one. Null is not an empty chart."""
+    if isinstance(result, dict):
+        return result
+    raise XiaomiApiError(path, 0, "missing object result")
 
 
 def _dedupe(rows: list[dict[str, Any]]) -> list[FeedRecord]:

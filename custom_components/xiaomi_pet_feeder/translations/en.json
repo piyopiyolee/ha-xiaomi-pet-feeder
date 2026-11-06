@@ -225,6 +225,7 @@
     "auth_expired": { "message": "The Xiaomi session expired. Sign in again from the integration page." },
     "update_failed": { "message": "Could not update from Xiaomi's cloud: {error}" },
     "device_offline": { "message": "The feeder is offline." },
+    "timezone_unknown": { "message": "The feeder did not report a usable timezone and Home Assistant has no timezone, so cloud history was not read and the schedule was not changed." },
     "command_failed": { "message": "The feeder did not accept the command: {error}" },
     "invalid_portions": { "message": "Portions must be between {min} and {max}." },
     "busy": { "message": "The feeder is already dispensing." },

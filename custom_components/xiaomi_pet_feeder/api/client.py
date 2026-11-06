@@ -162,19 +162,19 @@ class XiaomiCloudClient:
         )
         return list((result or {}).get("homelist") or [])
 
-    async def get_properties(
-        self, did: str, props: list[tuple[int, int]]
-    ) -> dict[tuple[int, int], Any]:
-        """Read MIoT properties; failed ones are left out."""
+    async def get_properties(self, did: str, props: list[tuple[int, int]]) -> list[dict[str, Any]]:
+        """Read MIoT properties, keeping failed rows so callers can tell them apart.
+
+        A missing or non-list result is an empty read (the device did not answer),
+        not a set of zeros.
+        """
         result = await self.request(
             "/miotspec/prop/get",
             {"params": [{"did": did, "siid": s, "piid": p} for s, p in props]},
         )
-        values: dict[tuple[int, int], Any] = {}
-        for item in result or []:
-            if item.get("code", 0) == 0 and "value" in item:
-                values[(item["siid"], item["piid"])] = item["value"]
-        return values
+        if not isinstance(result, list):
+            return []
+        return [item for item in result if isinstance(item, dict)]
 
     async def set_property(self, did: str, siid: int, piid: int, value: Any) -> None:
         """Write one MIoT property."""

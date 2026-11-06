@@ -17,8 +17,10 @@ from homeassistant.components.sensor import (
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfMass
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .api import DesiccantState, FeederStatus, Prop
+from .api.feeder import current_bowl_grams
 from .coordinator import FeederRecords
 from .data import Feeder, XiaomiPetFeederConfigEntry
 from .entity import FeederRecordsEntity, FeederStatusEntity, device_info
@@ -142,8 +144,18 @@ class StatusSensor(FeederStatusEntity, SensorEntity):
 
     @property
     def native_value(self) -> Any:
-        """Current value."""
+        """Current value. A stale cloud bowl cache is not a measurement."""
+        if self.entity_description.key == "bowl_food":
+            return current_bowl_grams(self.coordinator.data, dt_util.utcnow())
         return self.entity_description.value_fn(self.coordinator.data)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Bowl cache is labeled as cache, including when it is too old to show."""
+        if self.entity_description.key != "bowl_food" or self.coordinator.data is None:
+            return None
+        attrs = self.coordinator.data.bowl_attributes(dt_util.utcnow())
+        return attrs or None
 
 
 class EatenTodaySensor(FeederRecordsEntity, SensorEntity):
