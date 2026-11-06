@@ -30,6 +30,7 @@ from custom_components.xiaomi_pet_feeder.api.feeder import (
     Prop,
     current_bowl_grams,
     parse_device_tz_offset,
+    query_offsets,
 )
 from custom_components.xiaomi_pet_feeder.commands import device_minutes
 from custom_components.xiaomi_pet_feeder.const import CONF_DEVICES, CONF_SERVER, DOMAIN
@@ -256,7 +257,9 @@ async def test_failed_eco_result_is_not_zero_or_empty_history() -> None:
         await api.hourly(TAIPEI, dt.date(2026, 11, 6))
 
     zero = FeederApi(_Stub(0), "did", "owner")  # type: ignore[arg-type]
-    assert await zero.eaten_today(TAIPEI) == 0
+    reported = await zero.eaten_today(TAIPEI)
+    assert reported.grams == 0
+    assert reported.confirmed is True
     empty = FeederApi(_Stub([]), "did", "owner")  # type: ignore[arg-type]
     assert await empty.records_today(TAIPEI, dst=None) == []
 
@@ -300,7 +303,7 @@ async def test_pi2001_cloud_read_does_not_write_or_invent_grams(
     assert eaten[0]["timeZoneOffSetSeconds"] == TAIPEI
     assert eaten[0]["startTime"] == device_midnight(TAIPEI)
     feed_offsets = {call["timeZoneOffSetSeconds"] for call in cloud.calls_to(FEED)}
-    assert feed_offsets == {TAIPEI}
+    assert feed_offsets == {TAIPEI, 0}
     assert cloud.calls_to(PROP_SET) == []
     assert cloud.calls_to(ACTION) == []
 
@@ -369,6 +372,133 @@ async def test_null_history_does_not_publish_a_zero_day(
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.SETUP_RETRY
     assert not any(state.entity_id.endswith("eaten_today") for state in hass.states.async_all())
+
+
+def test_fallback_also_queries_the_event_zero_partition() -> None:
+    """piid 27 is the stored key. 0 is that key when 5.17 does not exist."""
+    assert query_offsets(TAIPEI, None, event_default=False) == (TAIPEI,)
+    assert query_offsets(TAIPEI, None, event_default=True) == (TAIPEI, 0)
+    assert query_offsets(-10800, True, event_default=False) == (-10800, -14400)
+    assert query_offsets(0, False, event_default=True) == (0, 3600)
+
+
+class _PartitionClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def request(self, path: str, data: dict[str, Any]) -> object:
+        self.calls.append((path, data))
+        offset = data["timeZoneOffSetSeconds"]
+        if path.endswith("getHasEatRecord"):
+            return 0 if offset == TAIPEI else 9
+        if offset == 0:
+            return [
+                {
+                    "ts": 1793894400,
+                    "siid": 2,
+                    "eiid": 1,
+                    "timeZoneOffSet": 0,
+                    "params": [{"piid": 18, "value": "9"}, {"piid": 27, "value": "0"}],
+                }
+            ]
+        return []
+
+
+async def test_zero_partition_is_used_and_empty_fallback_is_not_zero_intake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A structured 0 on the fallback offset is not intake. A 9 from offset 0 is the cloud total."""
+    _freeze(monkeypatch, dt.datetime(2026, 11, 6, 4, 6, tzinfo=dt.UTC))
+    client = _PartitionClient()
+    api = FeederApi(client, "did", "owner")  # type: ignore[arg-type]
+    eaten = await api.eaten_today(TAIPEI, event_default=True, confirmed=False)
+    assert eaten.grams == 9
+    assert eaten.confirmed is True
+    assert eaten.offset == 0
+    assert [call[1]["startTime"] for call in client.calls] == [device_midnight(TAIPEI)] * 2
+    records = await api.records_today(TAIPEI, dst=None, event_default=True)
+    assert [record.grams for record in records] == [9]
+    assert {call[1]["timeZoneOffSetSeconds"] for call in client.calls if call[0].endswith("getFeedRecord")} == {
+        TAIPEI,
+        0,
+    }
+
+    empty = _Stub(0)
+    missed = await FeederApi(empty, "did", "owner").eaten_today(  # type: ignore[arg-type]
+        TAIPEI, event_default=True, confirmed=False
+    )
+    assert missed.grams is None
+    assert missed.confirmed is False
+
+
+async def test_pi2001_empty_success_is_not_shown_as_zero(
+    hass: HomeAssistant, cloud: FakeCloud
+) -> None:
+    """Both partitions returning 0/[] leave the sensors unknown. No bowl arithmetic."""
+    await hass.config.async_set_time_zone("Asia/Taipei")
+    cloud.hide_prop(5, 17)
+    cloud.hide_prop(5, 19)
+    cloud.set_prop_fields(2, 22, value=64, updateTime=1, exe_time=0)
+
+    def route(path: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        if path.endswith("getHasEatRecord"):
+            return {"code": 0, "message": "sucess", "result": 0}
+        if path.endswith("getFeedRecord"):
+            return {"code": 0, "message": "sucess", "result": []}
+        return None
+
+    cloud.router = route
+    entry = _pi_entry()
+    await setup(hass, entry)
+    eaten = hass.states.get(eid(hass, "sensor", "eaten_today"))
+    log = hass.states.get(eid(hass, "sensor", "feeding_log"))
+    assert eaten.state == "unknown"
+    assert eaten.attributes["intake_confirmed"] is False
+    assert eaten.attributes["offsets_seconds"] == [TAIPEI, 0]
+    assert eaten.attributes["summary_offset_seconds"] is None
+    assert log.state == "unknown"
+    assert log.attributes["records"] is None
+    assert cloud.calls_to(PROP_SET) == []
+    assert cloud.calls_to(ACTION) == []
+
+
+async def test_pi2001_reads_the_zero_event_partition(
+    hass: HomeAssistant, cloud: FakeCloud
+) -> None:
+    """History stored with piid 27 = 0 is the eco total, not a bowl difference."""
+    await hass.config.async_set_time_zone("Asia/Taipei")
+    cloud.hide_prop(5, 17)
+    cloud.hide_prop(5, 19)
+
+    def route(path: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        offset = data.get("timeZoneOffSetSeconds") if isinstance(data, dict) else None
+        if path.endswith("getHasEatRecord"):
+            return {"code": 0, "message": "sucess", "result": 0 if offset == TAIPEI else 9}
+        if path.endswith("getFeedRecord"):
+            if offset != 0:
+                return {"code": 0, "message": "sucess", "result": []}
+            return {
+                "code": 0,
+                "message": "sucess",
+                "result": [
+                    {
+                        "ts": 1793894400,
+                        "siid": 2,
+                        "eiid": 1,
+                        "timeZoneOffSet": 0,
+                        "params": [{"piid": 18, "value": "9"}, {"piid": 27, "value": "0"}],
+                    }
+                ],
+            }
+        return None
+
+    cloud.router = route
+    await setup(hass, _pi_entry())
+    eaten = hass.states.get(eid(hass, "sensor", "eaten_today"))
+    assert eaten.state == "9"
+    assert eaten.attributes["intake_confirmed"] is True
+    assert eaten.attributes["summary_offset_seconds"] == 0
+    assert hass.states.get(eid(hass, "sensor", "feeding_log")).state == "1"
 
 
 async def test_unknown_timezone_does_not_query_as_utc(

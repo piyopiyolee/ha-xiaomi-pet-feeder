@@ -26,6 +26,8 @@ TZ_OFFSET_MIN = -43_200
 TZ_OFFSET_MAX = 50_400
 # A stored bowl reading older than this is not the current weight.
 BOWL_CACHE_MAX_AGE = dt.timedelta(hours=6)
+# Feed events carry this offset in piid 27 when the device has no 5.17.
+EVENT_OFFSET_DEFAULT = 0
 
 
 class Prop:
@@ -377,6 +379,24 @@ class FeederStatus:
         )
         return FeederStatus(values, readings, self.tz_fallback)
 
+    def property_cache(self) -> dict[str, Any]:
+        """Summarize cloud property age. An old stamp is not a replaced device."""
+        stamps = [
+            reading.update_time for reading in self.readings.values() if reading.update_time
+        ]
+        newest = max(stamps) if stamps else None
+        return {
+            "live_count": sum(
+                1 for reading in self.readings.values() if reading.ok and reading.live
+            ),
+            "cached_count": sum(
+                1 for reading in self.readings.values() if reading.ok and not reading.live
+            ),
+            "newest_update": None
+            if newest is None
+            else dt.datetime.fromtimestamp(newest, dt.UTC).isoformat(),
+        }
+
     def bowl_attributes(self, now: dt.datetime) -> dict[str, Any]:
         """Origin of the bowl reading. A cache is never described as live."""
         reading = self.readings.get(Prop.BOWL_WEIGHT)
@@ -399,6 +419,39 @@ class FeederStatus:
 def device_now(tz_offset: int) -> dt.datetime:
     """Return the current wall time of the device as a naive datetime."""
     return (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=tz_offset)).replace(tzinfo=None)
+
+
+def query_offsets(
+    tz_offset: int, dst: bool | None, *, event_default: bool = False
+) -> tuple[int, ...]:
+    """Return eco partition keys for one local day.
+
+    iv2001 with a reported 5.19 still adds the other seasonal hour. pi2001 has
+    no 5.17, so a Home Assistant fallback also asks for 0: public feed events
+    store that value in piid 27 and in ``timeZoneOffSet`` when the device zone
+    is not what was uploaded. The wall-clock ``startTime`` stays on ``tz_offset``.
+    """
+    offsets = [tz_offset]
+    if dst is not None:
+        offsets.append(tz_offset + (-3600 if dst else 3600))
+    if event_default and EVENT_OFFSET_DEFAULT not in offsets:
+        offsets.append(EVENT_OFFSET_DEFAULT)
+    return tuple(offsets)
+
+
+@dataclass(frozen=True, slots=True)
+class EatenToday:
+    """Cloud total for the local day.
+
+    ``grams is None`` when every partition returned a numeric 0 or an empty
+    history and the offset was not reported by the device. That is not a
+    verified intake of 0 g.
+    """
+
+    grams: int | None
+    confirmed: bool
+    offset: int | None
+    offsets: tuple[int, ...]
 
 
 def device_midnight(tz_offset: int, day: dt.date | None = None) -> int:
@@ -438,37 +491,50 @@ class FeederApi:
             "accessKey": ACCESS_KEY,
         }
 
-    async def eaten_today(self, tz_offset: int) -> int:
-        """Grams eaten since device midnight (the app's "Food eaten today").
+    async def eaten_today(
+        self,
+        tz_offset: int,
+        dst: bool | None = None,
+        *,
+        event_default: bool = False,
+        confirmed: bool = True,
+    ) -> EatenToday:
+        """Grams eaten since local midnight.
 
-        A numeric 0 is a real zero. A null or non-numeric result is a failure,
-        not 0 g.
+        A numeric 0 from the device's own offset is a real zero. The same 0
+        from only a fallback offset is not. A null result is still an error.
         """
         path = f"{ECO_API}/getHasEatRecord"
-        result = await self.client.request(
-            path,
-            self._eco_base(tz_offset) | {"startTime": device_midnight(tz_offset)},
-        )
-        return _int_result(result, path)
+        offsets = query_offsets(tz_offset, dst, event_default=event_default)
+        start = device_midnight(tz_offset)
+        for offset in offsets:
+            grams = _int_result(
+                await self.client.request(
+                    path,
+                    self._eco_base(offset) | {"startTime": start},
+                ),
+                path,
+            )
+            if grams:
+                return EatenToday(grams, True, offset, offsets)
+        if confirmed:
+            return EatenToday(0, True, tz_offset, offsets)
+        return EatenToday(None, False, None, offsets)
 
     @staticmethod
     def _offsets(tz_offset: int, dst: bool | None) -> tuple[int, ...]:
-        """Offsets queried for one day.
+        """Seasonal offsets only, without the pi2001 event-default partition."""
+        return query_offsets(tz_offset, dst, event_default=False)
 
-        iv2001 plugin 1.1.x asks for the reported offset and the other seasonal
-        offset (``dst`` true or false). pi2001 has no 5.19, so ``dst is None``
-        and only the resolved offset is sent.
-        """
-        if dst is None:
-            return (tz_offset,)
-        return tz_offset, tz_offset + (-3600 if dst else 3600)
-
-    async def records_today(self, tz_offset: int, dst: bool | None = None) -> list[FeedRecord]:
+    async def records_today(
+        self, tz_offset: int, dst: bool | None = None, *, event_default: bool = False
+    ) -> list[FeedRecord]:
         """Meals and dispenses of today, oldest first."""
         rows: list[dict[str, Any]] = []
         path = f"{ECO_API}/getFeedRecord"
-        for offset in self._offsets(tz_offset, dst):
-            start = device_midnight(tz_offset)
+        start_of_day = device_midnight(tz_offset)
+        for offset in query_offsets(tz_offset, dst, event_default=event_default):
+            start = start_of_day
             for _ in range(10):
                 page = _list_result(
                     await self.client.request(
@@ -490,11 +556,13 @@ class FeederApi:
         end_ts: int,
         dst: bool | None = None,
         limit: int = 2000,
+        *,
+        event_default: bool = False,
     ) -> list[FeedRecord]:
         """History between two timestamps (the cloud keeps 90 days), newest first."""
         rows: list[dict[str, Any]] = []
         path = f"{ECO_API}/multiGetFeedRecord"
-        for offset in self._offsets(tz_offset, dst):
+        for offset in query_offsets(tz_offset, dst, event_default=event_default):
             cursor = end_ts
             fetched = 0
             while fetched < limit:
@@ -514,53 +582,61 @@ class FeederApi:
         records.reverse()
         return records
 
-    async def hourly(self, tz_offset: int, day: dt.date) -> dict[str, Any]:
+    async def hourly(
+        self,
+        tz_offset: int,
+        day: dt.date,
+        *,
+        event_default: bool = False,
+        confirmed: bool = True,
+    ) -> dict[str, Any]:
         """Hourly chart of one day: grams eaten and portions dispensed per hour."""
         path = f"{ECO_API}/getHourlyRecord"
-        result = _object_result(
-            await self.client.request(
+        start = device_midnight(tz_offset, day)
+        chosen: dict[str, Any] | None = None
+        for offset in query_offsets(tz_offset, None, event_default=event_default):
+            result = _object_result(
+                await self.client.request(
+                    path, self._eco_base(offset) | {"startTime": start}
+                ),
                 path,
-                self._eco_base(tz_offset) | {"startTime": device_midnight(tz_offset, day)},
-            ),
-            path,
-        )
-        return {
-            "date": day.isoformat(),
-            "eaten_grams": {
-                int(r["hour"]): int(r["param"] or 0)
-                for r in result.get("hourlyEatFoodRecords") or []
-            },
-            "dispensed_portions": {
-                int(r["hour"]): round(int(r["param"] or 0) / GRAMS_PER_PORTION)
-                for r in result.get("hourlyOutFoodRecords") or []
-            },
-            "low_intake_percent": result.get("lowEatFoodParam"),
-        }
+            )
+            chosen = _hourly_chart(day, result)
+            if chosen["eaten_grams"] or chosen["dispensed_portions"]:
+                chosen["intake_confirmed"] = True
+                return chosen
+        assert chosen is not None
+        chosen["intake_confirmed"] = confirmed
+        return chosen
 
-    async def daily(self, tz_offset: int, start: dt.date, end: dt.date) -> dict[str, Any]:
+    async def daily(
+        self,
+        tz_offset: int,
+        start: dt.date,
+        end: dt.date,
+        *,
+        event_default: bool = False,
+        confirmed: bool = True,
+    ) -> dict[str, Any]:
         """Daily chart: grams eaten and food left in the bowl at midnight."""
         path = f"{ECO_API}/getDailyRecord"
-        result = _object_result(
-            await self.client.request(
-                path,
-                self._eco_base(tz_offset)
-                | {
-                    "startTime": device_midnight(tz_offset, start),
-                    "endTime": device_midnight(tz_offset, end) + 86399,
-                },
-            ),
-            path,
-        )
-        return {
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "eaten_grams": {
-                r["date"]: int(r["param"] or 0) for r in result.get("dailyEatFoodRecords") or []
-            },
-            "left_in_bowl_grams": {
-                r["date"]: int(r["param"] or 0) for r in result.get("dailyRestFoodRecords") or []
-            },
+        body = {
+            "startTime": device_midnight(tz_offset, start),
+            "endTime": device_midnight(tz_offset, end) + 86399,
         }
+        chosen: dict[str, Any] | None = None
+        for offset in query_offsets(tz_offset, None, event_default=event_default):
+            result = _object_result(
+                await self.client.request(path, self._eco_base(offset) | body),
+                path,
+            )
+            chosen = _daily_chart(start, end, result)
+            if chosen["eaten_grams"] or chosen["left_in_bowl_grams"]:
+                chosen["intake_confirmed"] = True
+                return chosen
+        assert chosen is not None
+        chosen["intake_confirmed"] = confirmed
+        return chosen
 
     async def desiccant(self, home_id: int, home_owner: int) -> Desiccant | None:
         """Desiccant state from the consumables API (MIoT 6.1/6.2 always read 0)."""
@@ -630,6 +706,34 @@ def _object_result(result: Any, path: str) -> dict[str, Any]:
     if isinstance(result, dict):
         return result
     raise XiaomiApiError(path, 0, "missing object result")
+
+
+def _hourly_chart(day: dt.date, result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": day.isoformat(),
+        "eaten_grams": {
+            int(row["hour"]): int(row["param"] or 0)
+            for row in result.get("hourlyEatFoodRecords") or []
+        },
+        "dispensed_portions": {
+            int(row["hour"]): round(int(row["param"] or 0) / GRAMS_PER_PORTION)
+            for row in result.get("hourlyOutFoodRecords") or []
+        },
+        "low_intake_percent": result.get("lowEatFoodParam"),
+    }
+
+
+def _daily_chart(start: dt.date, end: dt.date, result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "eaten_grams": {
+            row["date"]: int(row["param"] or 0) for row in result.get("dailyEatFoodRecords") or []
+        },
+        "left_in_bowl_grams": {
+            row["date"]: int(row["param"] or 0) for row in result.get("dailyRestFoodRecords") or []
+        },
+    }
 
 
 def _dedupe(rows: list[dict[str, Any]]) -> list[FeedRecord]:

@@ -75,6 +75,7 @@ class FakeCloud:
         self.calls: list[tuple[str, Any]] = []
         self.responses = {name: load(name) for name in set(self.ROUTES.values())}
         self.overrides: dict[str, Any] = {}
+        self.router = None
 
     def calls_to(self, path: str) -> list[Any]:
         """Payloads sent to a path."""
@@ -105,6 +106,10 @@ class FakeCloud:
 
     async def post(self, _client: Any, path: str, data: Any) -> tuple[int, Any]:
         self.calls.append((path, copy.deepcopy(data)))
+        if self.router is not None:
+            routed = self.router(path, data)
+            if routed is not None:
+                return 200, routed
         if path in self.overrides:
             return 200, self.overrides[path]
         if path == "/miotspec/prop/set":

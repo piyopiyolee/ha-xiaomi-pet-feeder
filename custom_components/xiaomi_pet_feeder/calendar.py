@@ -131,6 +131,7 @@ class FeedingCalendar(FeederStatusEntity, CalendarEntity):
                     int(history_start.timestamp()),
                     int(history_end.timestamp()),
                     status.dst,
+                    event_default=status.timezone_source == "home_assistant",
                 )
             except XiaomiError as err:
                 raise HomeAssistantError(

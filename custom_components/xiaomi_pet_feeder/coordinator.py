@@ -51,10 +51,13 @@ def home_assistant_utc_offset(hass: HomeAssistant) -> int | None:
 class FeederRecords:
     """Cloud side data: what the app shows from its eco service."""
 
-    eaten_today: int
-    today: list[FeedRecord]
+    eaten_today: int | None
+    today: list[FeedRecord] | None
     new: list[FeedRecord] = field(default_factory=list)
     desiccant: Desiccant | None = None
+    intake_confirmed: bool = True
+    offsets: tuple[int, ...] = ()
+    summary_offset: int | None = None
 
 
 class FeederStatusCoordinator(DataUpdateCoordinator[FeederStatus]):
@@ -171,9 +174,18 @@ class FeederRecordsCoordinator(DataUpdateCoordinator[FeederRecords]):
         status = self.status.data
         if status is None or not status.timezone_resolved:
             raise UpdateFailed(translation_domain=DOMAIN, translation_key="timezone_unknown")
+        event_default = status.timezone_source == "home_assistant"
+        confirmed = status.timezone_source == "device"
         try:
-            eaten = await self.api.eaten_today(status.tz_offset)
-            today = await self.api.records_today(status.tz_offset, status.dst)
+            eaten = await self.api.eaten_today(
+                status.tz_offset,
+                status.dst,
+                event_default=event_default,
+                confirmed=confirmed,
+            )
+            found = await self.api.records_today(
+                status.tz_offset, status.dst, event_default=event_default
+            )
             await self._update_desiccant()
         except XiaomiAuthError as err:
             raise ConfigEntryAuthFailed(
@@ -186,15 +198,28 @@ class FeederRecordsCoordinator(DataUpdateCoordinator[FeederRecords]):
                 translation_placeholders={"error": str(err)},
             ) from err
 
-        keys = {r.key for r in today}
-        if self._seen is None:
+        # A numeric 0 plus an empty log is verified only for a device-reported offset.
+        today = None if eaten.grams is None and not found else found
+        if today is None:
             new: list[FeedRecord] = []
-            self._seen = keys
         else:
-            new = [r for r in today if r.key not in self._seen]
-            # Keep yesterday's keys too so a late upload around midnight is not lost.
-            self._seen = (self._seen | keys) if len(self._seen) < 2000 else keys
-        return FeederRecords(eaten_today=eaten, today=today, new=new, desiccant=self._desiccant)
+            keys = {record.key for record in today}
+            if self._seen is None:
+                new = []
+                self._seen = keys
+            else:
+                new = [record for record in today if record.key not in self._seen]
+                # Keep yesterday's keys too so a late upload around midnight is not lost.
+                self._seen = (self._seen | keys) if len(self._seen) < 2000 else keys
+        return FeederRecords(
+            eaten_today=eaten.grams,
+            today=today,
+            new=new,
+            desiccant=self._desiccant,
+            intake_confirmed=eaten.confirmed,
+            offsets=eaten.offsets,
+            summary_offset=eaten.offset,
+        )
 
     async def _update_desiccant(self) -> None:
         if self._home is None:

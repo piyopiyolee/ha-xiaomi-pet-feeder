@@ -172,9 +172,19 @@ class EatenTodaySensor(FeederRecordsEntity, SensorEntity):
         super().__init__(feeder, "eaten_today")
 
     @property
-    def native_value(self) -> int:
-        """Grams eaten since device midnight."""
+    def native_value(self) -> int | None:
+        """Grams eaten since local midnight, or None when 0 is not verified."""
         return self.coordinator.data.eaten_today
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Tell a verified total from an empty eco partition."""
+        data = self.coordinator.data
+        return {
+            "intake_confirmed": data.intake_confirmed,
+            "offsets_seconds": list(data.offsets),
+            "summary_offset_seconds": data.summary_offset,
+        }
 
 
 class FeedingLogSensor(FeederRecordsEntity, SensorEntity):
@@ -188,15 +198,19 @@ class FeedingLogSensor(FeederRecordsEntity, SensorEntity):
         super().__init__(feeder, "feeding_log")
 
     @property
-    def native_value(self) -> int:
-        """Number of meals and dispenses today."""
-        return len(self.coordinator.data.today)
+    def native_value(self) -> int | None:
+        """Number of meals and dispenses today, or None when that empty is unverified."""
+        today = self.coordinator.data.today
+        if today is None:
+            return None
+        return len(today)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Today's records, newest first, like the app."""
         data: FeederRecords = self.coordinator.data
-        return {"records": [r.as_dict() for r in reversed(data.today)]}
+        records = None if data.today is None else [item.as_dict() for item in reversed(data.today)]
+        return {"records": records, "intake_confirmed": data.intake_confirmed}
 
 
 class DesiccantSensor(FeederRecordsEntity, SensorEntity):
